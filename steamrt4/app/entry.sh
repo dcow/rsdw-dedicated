@@ -328,17 +328,31 @@ function start() {
     while kill -0 "$server_pid" 2>/dev/null; do
       sleep "${STEAM_UPDATE_CHECK_INTERVAL_SECONDS}" &
       sleep_pid=$!
-      wait "$sleep_pid" 2>/dev/null || true
-      sleep_pid=""
+      # Wake when either the server or the update interval ends. This prevents
+      # a crashed server from leaving the container alive until the timer
+      # completes.
+      wait -n "$server_pid" "$sleep_pid" 2>/dev/null || true
 
       if [[ "${shutdown_requested}" == "true" ]]; then
+        if kill -0 "$sleep_pid" 2>/dev/null; then
+          kill -TERM "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=""
         break
       fi
 
-      # The server may have exited while the update-check sleep was in progress.
+      # If the server exited first, stop and reap the outstanding timer so the
+      # entrypoint can return immediately.
       if ! kill -0 "$server_pid" 2>/dev/null; then
+        if kill -0 "$sleep_pid" 2>/dev/null; then
+          kill -TERM "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=""
         break
       fi
+      sleep_pid=""
 
       # Compare the locally installed build against the current public branch.
       local required_version=""
