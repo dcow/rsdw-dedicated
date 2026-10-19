@@ -4,8 +4,8 @@
 set -e
 
 # Globals
-STEAM_UPTODATECHECK_API="https://api.steampowered.com/ISteamApps/UpToDateCheck/v1/"
 STEAM_UPDATE_CHECK_INTERVAL_SECONDS=1800
+PUBLIC_BUILD_ID=""
 export RSDW_LAUNCH="${STEAMAPPDIR}/RSDragonwildsServer.sh"
 export RSDW_CONFIG="${STEAMAPPDIR}/RSDragonwilds/Saved/Config/LinuxServer/DedicatedServer.ini"
 
@@ -39,26 +39,151 @@ function get_installed_build_id() {
     return 1
   fi
 
-  jq -Rn --rawfile acf "${manifest}" '
+  jq -Rrn --rawfile acf "${manifest}" '
     $acf
     | capture("\"buildid\"\\s+\"(?<buildid>[0-9]+)\"").buildid
   ' 2>/dev/null
 }
 
-# This flow intentionally targets the current `public` branch behavior only.
-# `UpToDateCheck` has no beta/branch selector.
-# `steamcmd +app_info_print` is intentionally avoided due to Valve issues:
-# https://github.com/ValveSoftware/steam-for-linux/issues/9683
-# https://github.com/ValveSoftware/steam-for-linux/issues/11521
-# Use Valve's documented `UpToDateCheck` API instead.
-function get_up_to_date_check() {
-  local installed_build_id="$1"
+function parse_public_build_id() {
+  local app_info_file="$1"
 
-  curl -fsS \
-    --get "${STEAM_UPTODATECHECK_API}" \
-    --data-urlencode "appid=${STEAMAPPID}" \
-    --data-urlencode "version=${installed_build_id}" \
-    --data-urlencode "format=json"
+  # app_info_print uses Valve's KeyValues format. Track the enclosing keys so
+  # build IDs for other branches or depots cannot be mistaken for `public`.
+  awk -v app_id="${STEAMAPPID}" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+
+      if (line == "{") {
+        depth++
+        stack[depth] = pending
+        pending = ""
+        next
+      }
+
+      if (line == "}") {
+        delete stack[depth]
+        depth--
+        pending = ""
+        next
+      }
+
+      if (line ~ /^"buildid"[[:space:]]+"[0-9]+"$/ \
+          && stack[depth] == "public" \
+          && stack[depth - 1] == "branches" \
+          && stack[depth - 2] == "depots" \
+          && stack[depth - 3] == app_id) {
+        sub(/^"buildid"[[:space:]]+"/, "", line)
+        sub(/"$/, "", line)
+        if (!found) {
+          build_id = line
+          found = 1
+        } else if (line != build_id) {
+          conflicting = 1
+        }
+        next
+      }
+
+      if (line ~ /^"[^"]+"$/) {
+        sub(/^"/, "", line)
+        sub(/"$/, "", line)
+        pending = line
+      } else {
+        pending = ""
+      }
+    }
+
+    END {
+      if (!found || conflicting) {
+        exit 1
+      }
+      print build_id
+    }
+  ' "${app_info_file}"
+}
+
+function get_public_build_id() {
+  local steam_user_home="${1:-${HOME}}"
+  local max_attempts=3
+  local attempt=0
+  local app_info_file=""
+  local -a parsed_build_ids=()
+  local steamcmd_rc=0
+  local -a app_info_cache_files=(
+    "${STEAMCMDDIR}/appcache/appinfo.vdf"
+    "${steam_user_home}/Steam/appcache/appinfo.vdf"
+    "${steam_user_home}/.local/share/Steam/appcache/appinfo.vdf"
+  )
+
+  PUBLIC_BUILD_ID=""
+  app_info_file=$(mktemp "${TMPDIR:-/tmp}/rsdw-app-info.XXXXXX") || {
+    echo "Warning: failed to create temporary file for Steam app info." >&2
+    return 1
+  }
+
+  while (( attempt < max_attempts )); do
+    if [[ "${shutdown_requested:-false}" == "true" ]]; then
+      rm -f "${app_info_file}"
+      return 1
+    fi
+
+    attempt=$((attempt + 1))
+
+    # Force SteamCMD to request fresh app metadata instead of accepting a stale
+    # app-info cache. These paths cover the SteamCMD and Steam client layouts.
+    if ! rm -f "${app_info_cache_files[@]}"; then
+      echo "Warning: failed to clear the Steam app-info cache (attempt ${attempt}/${max_attempts})." >&2
+      continue
+    fi
+
+    if [[ "${shutdown_requested:-false}" == "true" ]]; then
+      rm -f "${app_info_file}"
+      return 1
+    fi
+
+    : > "${app_info_file}"
+    timeout --signal=TERM --kill-after=10s 60s \
+      bash "${STEAMCMDDIR}/steamcmd.sh" \
+      +login anonymous \
+      +app_info_update 1 \
+      +app_info_print "${STEAMAPPID}" \
+      +quit > "${app_info_file}" 2>&1 &
+    update_check_pid=$!
+
+    if wait "${update_check_pid}"; then
+      steamcmd_rc=0
+    else
+      steamcmd_rc=$?
+    fi
+    update_check_pid=""
+
+    if [[ "${shutdown_requested:-false}" == "true" ]]; then
+      rm -f "${app_info_file}"
+      return 1
+    fi
+
+    if (( steamcmd_rc != 0 )); then
+      echo "Warning: SteamCMD app-info lookup failed with exit code ${steamcmd_rc} (attempt ${attempt}/${max_attempts})." >&2
+      continue
+    fi
+
+    parsed_build_ids=()
+    mapfile -t parsed_build_ids < <(parse_public_build_id "${app_info_file}")
+    if (( ${#parsed_build_ids[@]} == 1 )) \
+      && [[ "${parsed_build_ids[0]}" =~ ^[0-9]+$ ]]; then
+      PUBLIC_BUILD_ID="${parsed_build_ids[0]}"
+      rm -f "${app_info_file}"
+      return 0
+    fi
+
+    echo "Warning: SteamCMD returned no unique, valid public build ID (attempt ${attempt}/${max_attempts})." >&2
+  done
+
+  rm -f "${app_info_file}"
+  return 1
 }
 
 function download() {
@@ -151,13 +276,19 @@ function start() {
   # or K8S, which will resurrect/restart the container automatically on exit.
   local server_pid=""
   local sleep_pid=""
+  local update_check_pid=""
+  local shutdown_requested="false"
 
   cleanup() {
+    shutdown_requested="true"
     if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
       kill -TERM "$server_pid" 2>/dev/null || true
     fi
     if [[ -n "$sleep_pid" ]] && kill -0 "$sleep_pid" 2>/dev/null; then
       kill -TERM "$sleep_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$update_check_pid" ]] && kill -0 "$update_check_pid" 2>/dev/null; then
+      kill -TERM "$update_check_pid" 2>/dev/null || true
     fi
   }
 
@@ -197,31 +328,55 @@ function start() {
     while kill -0 "$server_pid" 2>/dev/null; do
       sleep "${STEAM_UPDATE_CHECK_INTERVAL_SECONDS}" &
       sleep_pid=$!
-      wait "$sleep_pid" 2>/dev/null || true
-      # Compare the locally installed public-branch build against Valve's current required version.
-      local up_to_date_check_response=""
-      if up_to_date_check_response="$(get_up_to_date_check "${STEAMPIPE_BUILD_ID}")"; then
-        local success=""
-        local up_to_date=""
-        local required_version=""
-        if ! success="$(jq -r '.response.success // empty' <<<"${up_to_date_check_response}")" \
-          || ! up_to_date="$(jq -r '.response.up_to_date // empty' <<<"${up_to_date_check_response}")" \
-          || ! required_version="$(jq -r '.response.required_version // empty' <<<"${up_to_date_check_response}")"; then
-          echo "Warning: failed to parse Steam UpToDateCheck response; continuing with current server process."
-        elif [[ "${success}" == "true" && "${up_to_date}" == "false" ]]; then
+      # Wake when either the server or the update interval ends. This prevents
+      # a crashed server from leaving the container alive until the timer
+      # completes.
+      wait -n "$server_pid" "$sleep_pid" 2>/dev/null || true
+
+      if [[ "${shutdown_requested}" == "true" ]]; then
+        if kill -0 "$sleep_pid" 2>/dev/null; then
+          kill -TERM "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=""
+        break
+      fi
+
+      # If the server exited first, stop and reap the outstanding timer so the
+      # entrypoint can return immediately.
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        if kill -0 "$sleep_pid" 2>/dev/null; then
+          kill -TERM "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" 2>/dev/null || true
+        sleep_pid=""
+        break
+      fi
+      sleep_pid=""
+
+      # Compare the locally installed build against the current public branch.
+      local required_version=""
+      if get_public_build_id; then
+        if [[ "${shutdown_requested}" == "true" ]]; then
+          break
+        fi
+        required_version="${PUBLIC_BUILD_ID}"
+        if [[ "${required_version}" != "${STEAMPIPE_BUILD_ID}" ]]; then
           # Stopping on update is opt-in; restart behavior belongs to the container runtime or orchestrator.
           if [[ "$RSDW_AUTO_STOP_ON_UPDATE" == "true" ]]; then
             echo "New Steam version is available (installed=${STEAMPIPE_BUILD_ID}, required=${required_version}), stopping server."
-            kill -TERM "$server_pid"
+            kill -TERM "$server_pid" 2>/dev/null || true
             break
           else
             echo "New Steam version is available (installed=${STEAMPIPE_BUILD_ID}, required=${required_version}), but RSDW_AUTO_STOP_ON_UPDATE is disabled; continuing to run current server."
           fi
         fi
       else
-        echo "Warning: failed to query Steam UpToDateCheck; continuing with current server process."
+        if [[ "${shutdown_requested}" == "true" ]]; then
+          break
+        fi
+        echo "Warning: failed to determine the current public Steam build ID; continuing with current server process." >&2
       fi
-      sleep_pid=""
     done
 
     wait "$server_pid" 2>/dev/null || true
