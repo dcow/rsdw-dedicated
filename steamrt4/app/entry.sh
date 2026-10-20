@@ -279,10 +279,24 @@ function start() {
   local update_check_pid=""
   local shutdown_requested="false"
 
+  # RSDragonwildsServer.sh runs the game binary as a child instead of exec'ing it, so signalling
+  # server_pid only kills that shell: this script then exits and the game is SIGKILLed with the
+  # container, skipping its shutdown. Signal the game itself; the shell exits once the game has.
+  stop_server() {
+    local target="$server_pid"
+    if [[ "$GAMELIFT" != "true" ]]; then
+      target="$(pgrep -P "$server_pid" | head -n 1)"
+      if [[ -z "$target" ]]; then
+        target="$server_pid"
+      fi
+    fi
+    kill -TERM "$target" 2>/dev/null || true
+  }
+
   cleanup() {
     shutdown_requested="true"
     if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
-      kill -TERM "$server_pid" 2>/dev/null || true
+      stop_server
     fi
     if [[ -n "$sleep_pid" ]] && kill -0 "$sleep_pid" 2>/dev/null; then
       kill -TERM "$sleep_pid" 2>/dev/null || true
@@ -365,7 +379,7 @@ function start() {
           # Stopping on update is opt-in; restart behavior belongs to the container runtime or orchestrator.
           if [[ "$RSDW_AUTO_STOP_ON_UPDATE" == "true" ]]; then
             echo "New Steam version is available (installed=${STEAMPIPE_BUILD_ID}, required=${required_version}), stopping server."
-            kill -TERM "$server_pid" 2>/dev/null || true
+            stop_server
             break
           else
             echo "New Steam version is available (installed=${STEAMPIPE_BUILD_ID}, required=${required_version}), but RSDW_AUTO_STOP_ON_UPDATE is disabled; continuing to run current server."
